@@ -1,6 +1,6 @@
 # ios-xun
 
-**XNU/iOS 16 bring-up on a Xiaomi Redmi Pad SE (Snapdragon 680 / "bengal", 8 GB eMMC).**
+**XNU/iOS 16 bring-up on a Xiaomi Redmi Pad SE (Snapdragon 680 / bengal), 8 GB RAM / 256 GB eMMC.**
 
 This repository is the xun adaptation of ios-topaz, whose bring-up state is tracked here: the XNU kernel boots to the panel console on the Pad SE, and storage-root support is being moved from topaz's UFS path to the tablet's SDHCI/eMMC controller (in progress). Boot, vendor_boot and firmware partitions are never written; the kernel is still started from RAM only with `fastboot boot`.
 
