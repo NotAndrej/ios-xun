@@ -244,7 +244,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # SWEET emmc: SDHCI host for eMMC-based bring-up ports.
     emmc = node('sweet-emmc', [ph(), ('reg', u64(0x04744000, 0x1000))])
 
-return node('device-tree', [
+    return node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
