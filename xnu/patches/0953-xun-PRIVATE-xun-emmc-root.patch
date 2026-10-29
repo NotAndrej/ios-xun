@@ -1,12 +1,12 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -107,2 +107,3 @@
-
-
+@@ -106,1 +106,2 @@
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/sweet_emmc.c			standard
---- a/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:27.092252033 +0100
+
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+/tmp/keeping a/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:27.092252033 +0100
 +++ b/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:15.999346513 +0100
 @@ -785,6 +785,26 @@
  #endif
@@ -35,6 +35,9 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  //
  //	Now check if we are trying to root on a memory device
  //
+
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+new file mode 100644
 --- /dev/null	2026-10-29 06:10:26.054763197 +0100
 +++ b/bsd/dev/sweet_emmc.c	2026-10-29 18:09:09.096624812 +0100
 @@ -0,0 +1,1091 @@
@@ -1129,3 +1132,4 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 +#else  /* !ARM64_BOARD_CONFIG_SWEET */
 +typedef int sweet_emmc_empty_tu_t;
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+
