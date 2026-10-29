@@ -1,6 +1,8 @@
-# ios-topaz
+# ios-xun
 
-**Apple's iOS 16 running on a Redmi Note 12 4G.**
+**XNU/iOS 16 bring-up on a Xiaomi Redmi Pad SE (Snapdragon 680 / "bengal", 8 GB eMMC).**
+
+This repository is the xun adaptation of ios-topaz, whose bring-up state is tracked here: the XNU kernel boots to the panel console on the Pad SE, and storage-root support is being moved from topaz's UFS path to the tablet's SDHCI/eMMC controller (in progress). Boot, vendor_boot and firmware partitions are never written; the kernel is still started from RAM only with `fastboot boot`.
 
 This is a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) (Apple's open-source XNU kernel, xnu-8796, on a Redmi Note 10 Pro) to the Xiaomi **Redmi Note 12 4G** (`topaz` / `tapas`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
@@ -21,7 +23,7 @@ As of **2026-10-20** the phone boots to the **iOS home screen** on the four Cort
 | Boot | Stock Xiaomi ABL → `fastboot boot` of our shim (boot image v4) → XNU. Boot slots and other OSes on the phone are not touched |
 | CPU | The four Cortex-A73 ("Gold", MPIDR `0x100`–`0x103`) cores, 16K pages, GICv3, timers. The Silver cores are parked (see below) |
 | Memory | The upper DDR bank, `0x1_40000000` + 4 GiB |
-| Storage | UFS host driver (UFS 3.0 at `0x4804000`); the iOS root is a journaled HFS+ volume in `userdata`, read/write |
+| Storage | UFS host driver is the topaz reference; the Remove Pad SE port uses its SDHCI/eMMC controller (`mmcblk0`, SDHCI at `0x04744000`) for a read-only `emmcroot*` path. Full HFS+ root support for eMMC is in progress |
 | iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
 | Display | Kernel IOSurface (`SweetSurface`) + IOMobileFramebuffer (`AppleCLCD`); the MDP scans iOS surfaces directly from contiguous RAM below 4 GiB, double-buffered, with real cache maintenance (the Apple SoC config made it a no-op). Presented to iOS as an iPhone X panel (1125×2436 canvas centred on the 1080×2400 panel) |
 | GUI | backboardd, SpringBoard, lock screen, home screen, Settings and other apps |
