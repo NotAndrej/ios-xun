@@ -241,8 +241,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' and qcom,kryo470 stay because the
     # SweetPlatformExpert and CPU IONameMatch still use them.
-        # SWEET emmc: SDHCI host for eMMC-based bring-up ports.
-    emmc = node('sweet-emmc', [ph(), ('reg', u64(0x04744000, 0x1000))])
+    # XUN eMMC: SDHCI host for the Redmi Pad SE read-only bring-up driver.
+    emmc = node('xun-emmc', [ph(), ('reg', u64(0x04744000, 0x1000))])
 
     return node('device-tree', [
         ph(),
