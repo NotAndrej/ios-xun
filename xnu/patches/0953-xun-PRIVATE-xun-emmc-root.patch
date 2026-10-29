@@ -1,35 +1,33 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,3 +106,4 @@
+@@ -105,6 +105,7 @@
+
+
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/sweet_emmc.c			standard
  bsd/dev/redwood_sta.c		standard
-diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
---- a/iokit/bsddev/IOKitBSDInit.cpp
-+++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -785,5 +785,28 @@
+--- a/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:27.092252033 +0100
++++ b/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:15.999346513 +0100
+@@ -785,6 +785,26 @@
  #endif
--
+ 
+ 
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	if (strcmp(rdBootVar, "emmcroot0") == 0) {
-+		extern int xun_emmc_find_root(const char *rd, char *root_name,
++		extern int sweet_emmc_find_root(const char *rd, char *root_name,
 +		                               size_t name_sz, dev_t *root);
-+		int emmc_error = xun_emmc_find_root(rdBootVar, rootName, rootNameSize, root);
-+		/*
-+		 * xun_emmc_find_root() follows the usual probe convention:
-+		 * zero means that rd= belongs to another provider, one means it
-+		 * claimed and resolved the root, and negative values are -errno.
-+		 * This branch is reached only for emmcroot0, but keep the explicit
-+		 * success value so a failed eMMC probe can never fall through to an
-+		 * unrelated IOKit root provider.
-+		 */
-+		if (emmc_error == 1) {
++		int emmc_error = sweet_emmc_find_root(rdBootVar, rootName, rootNameSize, root);
++		if (emmc_error == 0) {
 +			IOLog("BSD root: emmcroot0, major %d, minor %d\n",
 +			      major(*root), minor(*root));
 +			*oflags = 0;
 +			goto iofrootx;
++		}
++		if (emmc_error == 1) {
++			/* Handled but not our exact failure value? treat as failure. */
++			panic("IOFindBSDRoot: SWEET emmc root %s handling failed", rdBootVar);
 +		}
 +		panic("IOFindBSDRoot: SWEET emmc root %s unavailable: %d",
 +		      rdBootVar, -emmc_error);
@@ -40,8 +38,8 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
  //	Now check if we are trying to root on a memory device
  //
 --- /dev/null	2026-10-29 06:10:26.054763197 +0100
-+++ b/bsd/dev/sweet_emmc.c	2026-10-29 13:26:50.944258165 +0100
-@@ -0,0 +1,1058 @@
++++ b/bsd/dev/sweet_emmc.c	2026-10-29 18:09:09.096624812 +0100
+@@ -0,0 +1,1091 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -62,15 +60,14 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 + *     We rely on ABL having left SDCC1 clocked, the card in transfer state and
 + *     the bus mode (HS200/HS400, DLL) configured. We only reset the CMD and
 + *     DATA lines (never SOFTWARE_RESET_ALL, that would drop the clock setup).
-+ *   - Registration with BSD (bdevsw_add) happens only after xun_emmc_init()
++ *   - Registration with BSD (bdevsw_add) happens only after sweet_emmc_init()
 + *     succeeded.
 + *   - Everything is guarded by ARM64_BOARD_CONFIG_SWEET.
 + *
-+ * When ABL leaves SDCC1's SD clock gate off, xemmc_hw_bringup() restores only
-+ * the standard SDHCI clock and power-enable bits. It never changes the GCC
-+ * source clock, rails, bus mode, DLL tuning, or card state that ABL chose.
-+ * A missing source clock is reported as ENOTSUP, which is the boundary for a
-+ * later, separate port of the GCC/RPM portions of msm_sdhci.c.
++ * Bring-up (clock / DLL / regulator / hard reset) is deliberately not done
++ * here yet. When ABL leaves SDCC1 gated, semmc_hw_bringup() is the single
++ * place to port msm_sdhci.c from the u-boot tree (clock rate, CORE_DLL_CONFIG
++ * sequence, CORE_VENDOR_SPEC, vreg/vqmmc, power-on handling).
 + */
 +
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -91,28 +88,26 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +
 +/* ------------------------------------------------------------------ */
 +/* Logging: single choke point so it can be pointed at the Sweet log   */
-+/* The eMMC path is independent from the inherited UFS implementation. */
++/* helper used by sweet_ufs.c without touching the rest of the file.   */
 +/* ------------------------------------------------------------------ */
-+#define XEMMC_LOG(fmt, ...) printf("XUN EMMC: " fmt "\n", ##__VA_ARGS__)
++#define SEMMC_LOG(fmt, ...) printf("SWEET EMMC: " fmt "\n", ##__VA_ARGS__)
 +
-+/* osfmk/arm/machine_routines.h does not export this to the BSD layer. */
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern void delay(int usec);
-+#define XEMMC_UDELAY(us) delay(us)
++#define SEMMC_UDELAY(us) delay(us)
 +
 +/* ------------------------------------------------------------------ */
 +/* Constants                                                           */
 +/* ------------------------------------------------------------------ */
-+#define XEMMC_DT_PATH           "/xun-emmc"
-+#define XEMMC_DEFAULT_PHYS      0x04744000ULL
-+#define XEMMC_DEFAULT_SIZE      0x1000ULL
-+#define XEMMC_SECTOR            512u
-+#define XEMMC_MAX_XFER_BLKS     128u            /* per CMD18, 64 KiB */
++#define SEMMC_DT_PATH           "/sweet-emmc"
++#define SEMMC_DEFAULT_PHYS      0x04744000ULL
++#define SEMMC_DEFAULT_SIZE      0x1000ULL
++#define SEMMC_SECTOR            512u
++#define SEMMC_MAX_XFER_BLKS     128u            /* per CMD18, 64 KiB */
 +
-+#define XEMMC_CMD_TIMEOUT_US    200000u
-+#define XEMMC_BUSY_TIMEOUT_US   2000000u
-+#define XEMMC_DATA_TIMEOUT_US   1000000u
-+#define XEMMC_INHIBIT_TIMEOUT_US 200000u
++#define SEMMC_CMD_TIMEOUT_US    200000u
++#define SEMMC_BUSY_TIMEOUT_US   2000000u
++#define SEMMC_DATA_TIMEOUT_US   1000000u
++#define SEMMC_INHIBIT_TIMEOUT_US 200000u
 +
 +/* Standard SDHCI register map */
 +#define SDHCI_ARGUMENT          0x08
@@ -173,7 +168,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +#define SDHCI_INT_ERR_MASK      0x03FF8000u
 +#define SDHCI_INT_ALL           0xFFFFFFFFu
 +/* status-enable bits we need latched while polling */
-+#define XEMMC_INT_ENABLE_MASK   (0x000000FFu | SDHCI_INT_ERR_MASK)
++#define SEMMC_INT_ENABLE_MASK   (0x000000FFu | SDHCI_INT_ERR_MASK)
 +
 +/* MMC commands */
 +#define MMC_SEND_EXT_CSD        8u
@@ -200,7 +195,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +/* ------------------------------------------------------------------ */
 +/* Driver state                                                        */
 +/* ------------------------------------------------------------------ */
-+struct xemmc_part {
++struct semmc_part {
 +	uint64_t first;
 +	uint64_t last;
 +	char     name[40];
@@ -214,67 +209,67 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +	int               attached;      /* controller + card verified */
 +	int               ready;         /* partition resolved, I/O allowed */
 +	int               major;         /* bdevsw major, -1 if unregistered */
-+	struct xemmc_part part;
-+} xemmc = { .major = -1 };
++	struct semmc_part part;
++} semmc = { .major = -1 };
 +
-+LCK_GRP_DECLARE(xemmc_lck_grp, "xun_emmc");
-+LCK_MTX_DECLARE(xemmc_lock, &xemmc_lck_grp);
++LCK_GRP_DECLARE(semmc_lck_grp, "sweet_emmc");
++LCK_MTX_DECLARE(semmc_lock, &semmc_lck_grp);
 +
 +/* ------------------------------------------------------------------ */
 +/* MMIO accessors (ml_io_map gives device memory: accesses are ordered) */
 +/* ------------------------------------------------------------------ */
 +static inline uint32_t
-+xemmc_r32(uint32_t off)
++semmc_r32(uint32_t off)
 +{
-+	return *(volatile uint32_t *)(xemmc.base + off);
++	return *(volatile uint32_t *)(semmc.base + off);
 +}
 +
 +static inline uint16_t
-+xemmc_r16(uint32_t off)
++semmc_r16(uint32_t off)
 +{
-+	return *(volatile uint16_t *)(xemmc.base + off);
++	return *(volatile uint16_t *)(semmc.base + off);
 +}
 +
 +static inline uint8_t
-+xemmc_r8(uint32_t off)
++semmc_r8(uint32_t off)
 +{
-+	return *(volatile uint8_t *)(xemmc.base + off);
++	return *(volatile uint8_t *)(semmc.base + off);
 +}
 +
 +static inline void
-+xemmc_w32(uint32_t off, uint32_t v)
++semmc_w32(uint32_t off, uint32_t v)
 +{
-+	*(volatile uint32_t *)(xemmc.base + off) = v;
++	*(volatile uint32_t *)(semmc.base + off) = v;
 +}
 +
 +static inline void
-+xemmc_w16(uint32_t off, uint16_t v)
++semmc_w16(uint32_t off, uint16_t v)
 +{
-+	*(volatile uint16_t *)(xemmc.base + off) = v;
++	*(volatile uint16_t *)(semmc.base + off) = v;
 +}
 +
 +static inline void
-+xemmc_w8(uint32_t off, uint8_t v)
++semmc_w8(uint32_t off, uint8_t v)
 +{
-+	*(volatile uint8_t *)(xemmc.base + off) = v;
++	*(volatile uint8_t *)(semmc.base + off) = v;
 +}
 +
 +/* little endian helpers for GPT / EXT_CSD parsing */
 +static inline uint32_t
-+xemmc_le32(const uint8_t *p)
++semmc_le32(const uint8_t *p)
 +{
 +	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
 +	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 +}
 +
 +static inline uint64_t
-+xemmc_le64(const uint8_t *p)
++semmc_le64(const uint8_t *p)
 +{
-+	return (uint64_t)xemmc_le32(p) | ((uint64_t)xemmc_le32(p + 4) << 32);
++	return (uint64_t)semmc_le32(p) | ((uint64_t)semmc_le32(p + 4) << 32);
 +}
 +
 +static uint32_t
-+xemmc_crc32(uint32_t crc, const uint8_t *p, size_t n)
++semmc_crc32(uint32_t crc, const uint8_t *p, size_t n)
 +{
 +	crc = ~crc;
 +	while (n--) {
@@ -291,99 +286,79 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +/* ------------------------------------------------------------------ */
 +
 +/*
-+ * SDCC1's register interface is already reachable (CAPABILITIES has a valid
-+ * value), so the GCC AHB clock and eMMC rails are alive.  The screen log from
-+ * the first probe showed only SDHCI_CLOCK_CONTROL and POWER_CONTROL cleared.
-+ *
-+ * This is intentionally an *ungate* operation, not controller init.  In
-+ * particular, do not reset the host, select a divider, change HOST_CONTROL2,
-+ * touch the Qualcomm DLL registers, or issue CMD0: those would discard the
-+ * bus/card configuration ABL left in place.  We only ask SDHCI to restart its
-+ * existing internal/card clock and mark its already-powered bus as enabled.
++ * Hook for clock / DLL / vreg / reset bring-up ported from
++ * u-boot drivers/mmc/msm_sdhci.c. Intentionally empty: first milestone is
++ * deferred read access on a controller ABL left running.
 + */
 +static int
-+xemmc_hw_bringup(void)
++semmc_hw_bringup(void)
 +{
-+	uint16_t clk, enabled;
-+	uint8_t pwr;
++	volatile uint32_t *power, *status2, *hc_mode;
++	vm_offset_t core;
 +
-+	if (xemmc.base == NULL) {
-+		return ENXIO;
++	core = ml_io_map(0x04745000ULL, PAGE_SIZE);
++	if (!core) {
++		SEMMC_LOG("bring-up: ml_io_map core failed");
++		return ENOMEM;
 +	}
-+	if (xemmc_r32(SDHCI_CAPABILITIES) == 0 ||
-+	    xemmc_r32(SDHCI_CAPABILITIES) == 0xFFFFFFFFu) {
-+		XEMMC_LOG("host interface clock is unavailable; GCC/RPM bring-up required");
-+		return ENOTSUP;
-+	}
++	power = (volatile uint32_t *)(core + 0x0);
++	status2 = (volatile uint32_t *)(core + 0x6c);
++	hc_mode = (volatile uint32_t *)(core + 0x78);
 +
-+	/* Do not select a voltage: the eMMC rails remain under ABL/RPM control. */
-+	pwr = xemmc_r8(SDHCI_POWER_CONTROL);
-+	if (!(pwr & SDHCI_POWER_ON)) {
-+		xemmc_w8(SDHCI_POWER_CONTROL, pwr | SDHCI_POWER_ON);
-+		XEMMC_UDELAY(100);
-+	}
++	SEMMC_LOG("bring-up: power=0x%08x status2=0x%08x hc_mode=0x%08x",
++	    power[0], status2[0], hc_mode[0]);
 +
-+	/* Preserve the bootloader's divisor and enable the SDHCI clock in order. */
-+	clk = xemmc_r16(SDHCI_CLOCK_CONTROL);
-+	clk &= (uint16_t)~SDHCI_CLK_CARD_EN;
-+	clk |= SDHCI_CLK_INT_EN;
-+	xemmc_w16(SDHCI_CLOCK_CONTROL, clk);
-+	for (uint32_t t = 0; t < XEMMC_CMD_TIMEOUT_US; t++) {
-+		clk = xemmc_r16(SDHCI_CLOCK_CONTROL);
-+		if (clk & SDHCI_CLK_INT_STABLE) {
++	/* Trigger self-reset through SW_RST bit (MSM driver). */
++	power[0] = power[0] | 0x00000080u;
++	for (uint32_t t = 0; t < 400000; t++) {
++		if (!(status2[0] & 0x1)) {
 +			break;
 +		}
-+		XEMMC_UDELAY(1);
++		delay(1);
 +	}
-+	if (!(clk & SDHCI_CLK_INT_STABLE)) {
-+		XEMMC_LOG("internal clock did not stabilize (clk=0x%04x); "
-+		    "GCC source clock is gated", clk);
-+		return ENOTSUP;
++	for (uint32_t t = 0; t < 200000; t++) {
++		if (!(power[0] & 0x00000080u)) {
++			break;
++		}
++		delay(1);
 +	}
-+
-+	enabled = clk | SDHCI_CLK_CARD_EN;
-+	xemmc_w16(SDHCI_CLOCK_CONTROL, enabled);
-+	XEMMC_UDELAY(10);
-+	enabled = xemmc_r16(SDHCI_CLOCK_CONTROL);
-+	if ((enabled & (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE |
-+	    SDHCI_CLK_CARD_EN)) != (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE |
-+	    SDHCI_CLK_CARD_EN)) {
-+		XEMMC_LOG("clock ungate did not latch (clk=0x%04x)", enabled);
-+		return ENOTSUP;
++	hc_mode[0] = 1;
++	for (uint32_t t = 0; t < 100000; t++) {
++		__asm__ volatile("" ::: "memory");
 +	}
-+	XEMMC_LOG("restored SD clock/power (clk=0x%04x pwr=0x%02x)", enabled,
-+	    xemmc_r8(SDHCI_POWER_CONTROL));
++	SEMMC_LOG("bring-up: after reset power=0x%08x status2=0x%08x hc_mode=0x%08x",
++	    power[0], status2[0], hc_mode[0]);
 +	return 0;
 +}
 +
 +static int
-+xemmc_wait_ps_clear(uint32_t mask, uint32_t timeout_us)
++semmc_wait_ps_clear(uint32_t mask, uint32_t timeout_us)
 +{
 +	for (uint32_t t = 0; t < timeout_us; t++) {
-+		if ((xemmc_r32(SDHCI_PRESENT_STATE) & mask) == 0) {
++		if ((semmc_r32(SDHCI_PRESENT_STATE) & mask) == 0) {
 +			return 0;
 +		}
-+		XEMMC_UDELAY(1);
++		SEMMC_UDELAY(1);
 +	}
 +	return ETIMEDOUT;
 +}
 +
 +static void
-+xemmc_reset_lines(uint8_t mask)
++semmc_reset_lines(uint8_t mask)
 +{
 +	/* CMD/DATA line reset only: SOFTWARE_RESET_ALL would drop ABL's clock. */
-+	xemmc_w8(SDHCI_SOFTWARE_RESET, mask);
++	semmc_w8(SDHCI_SOFTWARE_RESET, mask);
 +	for (uint32_t t = 0; t < 100000; t++) {
-+		if ((xemmc_r8(SDHCI_SOFTWARE_RESET) & mask) == 0) {
++		if ((semmc_r8(SDHCI_SOFTWARE_RESET) & mask) == 0) {
 +			return;
 +		}
-+		XEMMC_UDELAY(1);
++		SEMMC_UDELAY(1);
 +	}
-+	XEMMC_LOG("line reset 0x%x did not self-clear", mask);
++	SEMMC_LOG("line reset 0x%x did not self-clear", mask);
 +}
 +
 +static int
-+xemmc_err_to_errno(uint32_t st)
++semmc_err_to_errno(uint32_t st)
 +{
 +	if (st & (SDHCI_INT_CMD_TIMEOUT | SDHCI_INT_DATA_TIMEOUT)) {
 +		return ETIMEDOUT;
@@ -400,7 +375,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 + * beforehand and drain the buffer afterwards.
 + */
 +static int
-+xemmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t mode,
++semmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t mode,
 +    uint32_t *resp)
 +{
 +	uint32_t inhibit = SDHCI_PS_CMD_INHIBIT;
@@ -411,79 +386,79 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +	    ((flags & 3u) == SDHCI_CMD_RESP_BUSY)) {
 +		inhibit |= SDHCI_PS_DATA_INHIBIT;
 +	}
-+	err = xemmc_wait_ps_clear(inhibit, XEMMC_INHIBIT_TIMEOUT_US);
++	err = semmc_wait_ps_clear(inhibit, SEMMC_INHIBIT_TIMEOUT_US);
 +	if (err) {
-+		XEMMC_LOG("CMD%u: bus inhibit stuck (PS=0x%08x)", idx,
-+		    xemmc_r32(SDHCI_PRESENT_STATE));
++		SEMMC_LOG("CMD%u: bus inhibit stuck (PS=0x%08x)", idx,
++		    semmc_r32(SDHCI_PRESENT_STATE));
 +		return err;
 +	}
 +
-+	xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
-+	xemmc_w32(SDHCI_ARGUMENT, arg);
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++	semmc_w32(SDHCI_ARGUMENT, arg);
 +	/* TRANSFER_MODE (low half) + COMMAND (high half) in one write */
-+	xemmc_w32(SDHCI_TRANSFER_MODE,
++	semmc_w32(SDHCI_TRANSFER_MODE,
 +	    (((idx << 8) | flags) << 16) | (mode & 0xFFFFu));
 +
 +	for (uint32_t t = 0;; t++) {
-+		st = xemmc_r32(SDHCI_INT_STATUS);
++		st = semmc_r32(SDHCI_INT_STATUS);
 +		if (st & SDHCI_INT_ERR_MASK) {
-+			XEMMC_LOG("CMD%u arg=0x%08x failed, INT=0x%08x", idx, arg, st);
-+			xemmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
-+			xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
-+			return xemmc_err_to_errno(st);
++			SEMMC_LOG("CMD%u arg=0x%08x failed, INT=0x%08x", idx, arg, st);
++			semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++			semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++			return semmc_err_to_errno(st);
 +		}
 +		if (st & SDHCI_INT_CMD_COMPLETE) {
 +			break;
 +		}
-+		if (t >= XEMMC_CMD_TIMEOUT_US) {
-+			XEMMC_LOG("CMD%u arg=0x%08x poll timeout", idx, arg);
-+			xemmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++		if (t >= SEMMC_CMD_TIMEOUT_US) {
++			SEMMC_LOG("CMD%u arg=0x%08x poll timeout", idx, arg);
++			semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
 +			return ETIMEDOUT;
 +		}
-+		XEMMC_UDELAY(1);
++		SEMMC_UDELAY(1);
 +	}
-+	xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_CMD_COMPLETE);
 +
 +	if (resp != NULL && (flags & 3u) != SDHCI_CMD_RESP_NONE) {
-+		*resp = xemmc_r32(SDHCI_RESPONSE);
++		*resp = semmc_r32(SDHCI_RESPONSE);
 +	}
 +
 +	if ((flags & 3u) == SDHCI_CMD_RESP_BUSY && !(flags & SDHCI_CMD_DATA)) {
 +		for (uint32_t t = 0;; t++) {
-+			st = xemmc_r32(SDHCI_INT_STATUS);
++			st = semmc_r32(SDHCI_INT_STATUS);
 +			if (st & SDHCI_INT_ERR_MASK) {
-+				xemmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
-+				xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
-+				return xemmc_err_to_errno(st);
++				semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++				semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++				return semmc_err_to_errno(st);
 +			}
 +			if (st & SDHCI_INT_XFER_COMPLETE) {
 +				break;
 +			}
-+			if (t >= XEMMC_BUSY_TIMEOUT_US) {
++			if (t >= SEMMC_BUSY_TIMEOUT_US) {
 +				return ETIMEDOUT;
 +			}
-+			XEMMC_UDELAY(1);
++			SEMMC_UDELAY(1);
 +		}
-+		xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE);
++		semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE);
 +	}
 +	return 0;
 +}
 +
 +static int
-+xemmc_card_status(uint32_t *r1)
++semmc_card_status(uint32_t *r1)
 +{
-+	return xemmc_cmd(MMC_SEND_STATUS, xemmc.rca << 16,
++	return semmc_cmd(MMC_SEND_STATUS, semmc.rca << 16,
 +	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, 0, r1);
 +}
 +
 +/* Best effort CMD12 after a failed data transfer. Errors are ignored. */
 +static void
-+xemmc_abort(void)
++semmc_abort(void)
 +{
 +	uint32_t r1;
 +
-+	xemmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
-+	(void)xemmc_cmd(MMC_STOP_TRANSMISSION, 0,
++	semmc_reset_lines(SDHCI_RESET_CMD | SDHCI_RESET_DATA);
++	(void)semmc_cmd(MMC_STOP_TRANSMISSION, 0,
 +	    SDHCI_CMD_RESP_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, 0, &r1);
 +}
 +
@@ -492,7 +467,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 + * (8 = EXT_CSD, 17 = single, 18 = multi with auto CMD12).
 + */
 +static int
-+xemmc_xfer_read(uint32_t idx, uint32_t arg, uint32_t nblk, void *dst)
++semmc_xfer_read(uint32_t idx, uint32_t arg, uint32_t nblk, void *dst)
 +{
 +	uint8_t *out = (uint8_t *)dst;
 +	uint32_t mode = SDHCI_TM_BLKCNT_EN | SDHCI_TM_READ;
@@ -506,103 +481,103 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +		mode |= SDHCI_TM_MULTI | SDHCI_TM_AUTO_CMD12;
 +	}
 +
-+	err = xemmc_wait_ps_clear(SDHCI_PS_CMD_INHIBIT | SDHCI_PS_DATA_INHIBIT,
-+	    XEMMC_INHIBIT_TIMEOUT_US);
++	err = semmc_wait_ps_clear(SDHCI_PS_CMD_INHIBIT | SDHCI_PS_DATA_INHIBIT,
++	    SEMMC_INHIBIT_TIMEOUT_US);
 +	if (err) {
 +		return err;
 +	}
 +
-+	xemmc_w16(SDHCI_BLOCK_SIZE, (uint16_t)(0x7000u | XEMMC_SECTOR));
-+	xemmc_w16(SDHCI_BLOCK_COUNT, (uint16_t)nblk);
-+	xemmc_w8(SDHCI_TIMEOUT_CONTROL, 0xE);
++	semmc_w16(SDHCI_BLOCK_SIZE, (uint16_t)(0x7000u | SEMMC_SECTOR));
++	semmc_w16(SDHCI_BLOCK_COUNT, (uint16_t)nblk);
++	semmc_w8(SDHCI_TIMEOUT_CONTROL, 0xE);
 +
-+	err = xemmc_cmd(idx, arg,
++	err = semmc_cmd(idx, arg,
 +	    SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA,
 +	    mode, &r1);
 +	if (err) {
 +		return err;
 +	}
 +	if (r1 & MMC_STATUS_MASK) {
-+		XEMMC_LOG("CMD%u R1 error bits 0x%08x", idx, r1 & MMC_STATUS_MASK);
-+		xemmc_abort();
++		SEMMC_LOG("CMD%u R1 error bits 0x%08x", idx, r1 & MMC_STATUS_MASK);
++		semmc_abort();
 +		return EIO;
 +	}
 +
 +	for (uint32_t b = 0; b < nblk; b++) {
 +		for (uint32_t t = 0;; t++) {
-+			st = xemmc_r32(SDHCI_INT_STATUS);
++			st = semmc_r32(SDHCI_INT_STATUS);
 +			if (st & SDHCI_INT_ERR_MASK) {
-+				XEMMC_LOG("CMD%u data error INT=0x%08x at block %u/%u",
++				SEMMC_LOG("CMD%u data error INT=0x%08x at block %u/%u",
 +				    idx, st, b, nblk);
-+				xemmc_abort();
-+				xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
-+				return xemmc_err_to_errno(st);
++				semmc_abort();
++				semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++				return semmc_err_to_errno(st);
 +			}
 +			if (st & SDHCI_INT_DATA_AVAIL) {
 +				break;
 +			}
-+			if (t >= XEMMC_DATA_TIMEOUT_US) {
-+				XEMMC_LOG("CMD%u data poll timeout at block %u/%u",
++			if (t >= SEMMC_DATA_TIMEOUT_US) {
++				SEMMC_LOG("CMD%u data poll timeout at block %u/%u",
 +				    idx, b, nblk);
-+				xemmc_abort();
++				semmc_abort();
 +				return ETIMEDOUT;
 +			}
-+			XEMMC_UDELAY(1);
++			SEMMC_UDELAY(1);
 +		}
-+		xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_DATA_AVAIL);
-+		for (uint32_t w = 0; w < XEMMC_SECTOR / 4; w++) {
-+			uint32_t v = xemmc_r32(SDHCI_BUFFER);
++		semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_DATA_AVAIL);
++		for (uint32_t w = 0; w < SEMMC_SECTOR / 4; w++) {
++			uint32_t v = semmc_r32(SDHCI_BUFFER);
 +			memcpy(out, &v, sizeof(v));
 +			out += sizeof(v);
 +		}
 +	}
 +
 +	for (uint32_t t = 0;; t++) {
-+		st = xemmc_r32(SDHCI_INT_STATUS);
++		st = semmc_r32(SDHCI_INT_STATUS);
 +		if (st & SDHCI_INT_ERR_MASK) {
-+			xemmc_abort();
-+			xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
-+			return xemmc_err_to_errno(st);
++			semmc_abort();
++			semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++			return semmc_err_to_errno(st);
 +		}
 +		if (st & SDHCI_INT_XFER_COMPLETE) {
 +			break;
 +		}
-+		if (t >= XEMMC_BUSY_TIMEOUT_US) {
-+			XEMMC_LOG("CMD%u transfer-complete timeout", idx);
-+			xemmc_abort();
++		if (t >= SEMMC_BUSY_TIMEOUT_US) {
++			SEMMC_LOG("CMD%u transfer-complete timeout", idx);
++			semmc_abort();
 +			return ETIMEDOUT;
 +		}
-+		XEMMC_UDELAY(1);
++		SEMMC_UDELAY(1);
 +	}
-+	xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE | SDHCI_INT_DATA_AVAIL);
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_XFER_COMPLETE | SDHCI_INT_DATA_AVAIL);
 +	return 0;
 +}
 +
-+/* Read absolute device sectors (user data area). Caller holds xemmc_lock. */
++/* Read absolute device sectors (user data area). Caller holds semmc_lock. */
 +static int
-+xemmc_read_blocks(uint64_t lba, uint32_t nblk, void *dst)
++semmc_read_blocks(uint64_t lba, uint32_t nblk, void *dst)
 +{
 +	uint8_t *out = (uint8_t *)dst;
 +	int err;
 +
-+	if (xemmc.base == NULL) {
++	if (semmc.base == NULL) {
 +		return ENXIO;
 +	}
 +	if (lba + nblk > 0xFFFFFFFFULL) {
 +		return EINVAL;  /* eMMC block addressing is 32 bit */
 +	}
 +	while (nblk > 0) {
-+		uint32_t n = nblk > XEMMC_MAX_XFER_BLKS ? XEMMC_MAX_XFER_BLKS : nblk;
++		uint32_t n = nblk > SEMMC_MAX_XFER_BLKS ? SEMMC_MAX_XFER_BLKS : nblk;
 +
-+		err = xemmc_xfer_read(n > 1 ? MMC_READ_MULTIPLE_BLOCK :
++		err = semmc_xfer_read(n > 1 ? MMC_READ_MULTIPLE_BLOCK :
 +		    MMC_READ_SINGLE_BLOCK, (uint32_t)lba, n, out);
 +		if (err) {
-+			XEMMC_LOG("read lba=%llu n=%u failed (errno %d)",
++			SEMMC_LOG("read lba=%llu n=%u failed (errno %d)",
 +			    (unsigned long long)lba, n, err);
 +			return err;
 +		}
 +		lba += n;
-+		out += (size_t)n * XEMMC_SECTOR;
++		out += (size_t)n * SEMMC_SECTOR;
 +		nblk -= n;
 +	}
 +	return 0;
@@ -612,7 +587,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +/* GPT                                                                 */
 +/* ------------------------------------------------------------------ */
 +static int
-+xemmc_guid_is_zero(const uint8_t *g)
++semmc_guid_is_zero(const uint8_t *g)
 +{
 +	for (int i = 0; i < 16; i++) {
 +		if (g[i]) {
@@ -631,76 +606,76 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 + * EILSEQ (corrupt GPT), or an I/O errno.
 + */
 +static int
-+xemmc_gpt_scan(const char *want, int dump, struct xemmc_part *out)
++semmc_gpt_scan(const char *want, int dump, struct semmc_part *out)
 +{
-+	uint8_t sec[XEMMC_SECTOR] __attribute__((aligned(8)));
-+	struct xemmc_part found;
++	uint8_t sec[SEMMC_SECTOR] __attribute__((aligned(8)));
++	struct semmc_part found;
 +	uint64_t entries_lba;
 +	uint32_t hsz, num, esz, hcrc, acrc, crc = 0;
 +	uint64_t total, nsec;
 +	int have = 0, err;
 +
-+	err = xemmc_read_blocks(1, 1, sec);
++	err = semmc_read_blocks(1, 1, sec);
 +	if (err) {
 +		return err;
 +	}
 +	if (memcmp(sec, "EFI PART", 8) != 0) {
-+		XEMMC_LOG("no GPT signature at LBA 1");
++		SEMMC_LOG("no GPT signature at LBA 1");
 +		return EILSEQ;
 +	}
-+	hsz = xemmc_le32(sec + 12);
-+	if (hsz < 92 || hsz > XEMMC_SECTOR) {
-+		XEMMC_LOG("bad GPT header size %u", hsz);
++	hsz = semmc_le32(sec + 12);
++	if (hsz < 92 || hsz > SEMMC_SECTOR) {
++		SEMMC_LOG("bad GPT header size %u", hsz);
 +		return EILSEQ;
 +	}
-+	hcrc = xemmc_le32(sec + 16);
++	hcrc = semmc_le32(sec + 16);
 +	memset(sec + 16, 0, 4);
-+	if (xemmc_crc32(0, sec, hsz) != hcrc) {
-+		XEMMC_LOG("GPT header CRC mismatch");
++	if (semmc_crc32(0, sec, hsz) != hcrc) {
++		SEMMC_LOG("GPT header CRC mismatch");
 +		return EILSEQ;
 +	}
-+	if (xemmc_le64(sec + 24) != 1) {
-+		XEMMC_LOG("GPT MyLBA != 1");
++	if (semmc_le64(sec + 24) != 1) {
++		SEMMC_LOG("GPT MyLBA != 1");
 +		return EILSEQ;
 +	}
-+	entries_lba = xemmc_le64(sec + 72);
-+	num         = xemmc_le32(sec + 80);
-+	esz         = xemmc_le32(sec + 84);
-+	acrc        = xemmc_le32(sec + 88);
-+	if (num == 0 || num > 4096 || esz < 128 || (XEMMC_SECTOR % esz) != 0) {
-+		XEMMC_LOG("unsupported GPT geometry: %u entries x %u bytes", num, esz);
++	entries_lba = semmc_le64(sec + 72);
++	num         = semmc_le32(sec + 80);
++	esz         = semmc_le32(sec + 84);
++	acrc        = semmc_le32(sec + 88);
++	if (num == 0 || num > 4096 || esz < 128 || (SEMMC_SECTOR % esz) != 0) {
++		SEMMC_LOG("unsupported GPT geometry: %u entries x %u bytes", num, esz);
 +		return EINVAL;
 +	}
 +	total = (uint64_t)num * esz;
-+	nsec = (total + XEMMC_SECTOR - 1) / XEMMC_SECTOR;
-+	if (xemmc.dev_sectors && entries_lba + nsec > xemmc.dev_sectors) {
-+		XEMMC_LOG("GPT entry array beyond end of device");
++	nsec = (total + SEMMC_SECTOR - 1) / SEMMC_SECTOR;
++	if (semmc.dev_sectors && entries_lba + nsec > semmc.dev_sectors) {
++		SEMMC_LOG("GPT entry array beyond end of device");
 +		return EILSEQ;
 +	}
-+	XEMMC_LOG("GPT: %u entries x %u bytes at LBA %llu", num, esz,
++	SEMMC_LOG("GPT: %u entries x %u bytes at LBA %llu", num, esz,
 +	    (unsigned long long)entries_lba);
 +
 +	memset(&found, 0, sizeof(found));
 +	for (uint64_t s = 0; s < nsec; s++) {
-+		uint32_t bytes = (uint32_t)((total - s * XEMMC_SECTOR) < XEMMC_SECTOR ?
-+		    (total - s * XEMMC_SECTOR) : XEMMC_SECTOR);
++		uint32_t bytes = (uint32_t)((total - s * SEMMC_SECTOR) < SEMMC_SECTOR ?
++		    (total - s * SEMMC_SECTOR) : SEMMC_SECTOR);
 +
-+		err = xemmc_read_blocks(entries_lba + s, 1, sec);
++		err = semmc_read_blocks(entries_lba + s, 1, sec);
 +		if (err) {
 +			return err;
 +		}
-+		crc = xemmc_crc32(crc, sec, bytes);
++		crc = semmc_crc32(crc, sec, bytes);
 +
 +		for (uint32_t off = 0; off + esz <= bytes; off += esz) {
 +			const uint8_t *e = sec + off;
-+			struct xemmc_part p;
-+			uint32_t idx = (uint32_t)((s * XEMMC_SECTOR + off) / esz);
++			struct semmc_part p;
++			uint32_t idx = (uint32_t)((s * SEMMC_SECTOR + off) / esz);
 +
-+			if (xemmc_guid_is_zero(e)) {
++			if (semmc_guid_is_zero(e)) {
 +				continue;
 +			}
-+			p.first = xemmc_le64(e + 32);
-+			p.last  = xemmc_le64(e + 40);
++			p.first = semmc_le64(e + 32);
++			p.last  = semmc_le64(e + 40);
 +			memset(p.name, 0, sizeof(p.name));
 +			for (int i = 0; i < 36 && i < (int)sizeof(p.name) - 1; i++) {
 +				uint8_t lo = e[56 + 2 * i], hi = e[57 + 2 * i];
@@ -710,7 +685,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +				p.name[i] = (hi == 0 && lo >= 0x20 && lo < 0x7F) ? (char)lo : '?';
 +			}
 +			if (dump) {
-+				XEMMC_LOG("GPT #%u %-20s lba %llu..%llu (%llu MiB)", idx + 1,
++				SEMMC_LOG("GPT #%u %-20s lba %llu..%llu (%llu MiB)", idx + 1,
 +				    p.name, (unsigned long long)p.first,
 +				    (unsigned long long)p.last,
 +				    (unsigned long long)((p.last - p.first + 1) / 2048));
@@ -723,7 +698,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +	}
 +
 +	if (crc != acrc) {
-+		XEMMC_LOG("GPT entry array CRC mismatch (calc 0x%08x, hdr 0x%08x)",
++		SEMMC_LOG("GPT entry array CRC mismatch (calc 0x%08x, hdr 0x%08x)",
 +		    crc, acrc);
 +		return EILSEQ;
 +	}
@@ -734,8 +709,8 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +		return ENOENT;
 +	}
 +	if (found.last < found.first ||
-+	    (xemmc.dev_sectors && found.last >= xemmc.dev_sectors)) {
-+		XEMMC_LOG("partition '%s' has invalid extent", found.name);
++	    (semmc.dev_sectors && found.last >= semmc.dev_sectors)) {
++		SEMMC_LOG("partition '%s' has invalid extent", found.name);
 +		return EILSEQ;
 +	}
 +	*out = found;
@@ -746,14 +721,14 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +/* Controller attach (deferred-read: no reset, no re-clock)            */
 +/* ------------------------------------------------------------------ */
 +static int
-+xemmc_dt_lookup(uint64_t *phys, uint64_t *size)
++semmc_dt_lookup(uint64_t *phys, uint64_t *size)
 +{
 +	DTEntry entry;
 +	const void *prop = NULL;
 +	unsigned int plen = 0;
 +	const uint8_t *p;
 +
-+	if (SecureDTLookupEntry(NULL, XEMMC_DT_PATH, &entry) != kSuccess) {
++	if (SecureDTLookupEntry(NULL, SEMMC_DT_PATH, &entry) != kSuccess) {
 +		return ENOENT;
 +	}
 +	if (SecureDTGetProperty(entry, "reg", &prop, &plen) != kSuccess ||
@@ -762,11 +737,11 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +	}
 +	p = (const uint8_t *)prop;
 +	if (plen >= 16) {                       /* <u64 base, u64 size> */
-+		*phys = xemmc_le64(p);
-+		*size = xemmc_le64(p + 8);
++		*phys = semmc_le64(p);
++		*size = semmc_le64(p + 8);
 +	} else if (plen >= 8) {                 /* <u32 base, u32 size> */
-+		*phys = xemmc_le32(p);
-+		*size = xemmc_le32(p + 4);
++		*phys = semmc_le32(p);
++		*size = semmc_le32(p + 4);
 +	} else {
 +		return EINVAL;
 +	}
@@ -777,146 +752,138 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +}
 +
 +static int
-+xemmc_attach(void)
++semmc_attach(void)
 +{
-+	uint64_t phys = XEMMC_DEFAULT_PHYS, size = XEMMC_DEFAULT_SIZE;
-+	uint8_t extcsd[XEMMC_SECTOR] __attribute__((aligned(8)));
++	uint64_t phys = SEMMC_DEFAULT_PHYS, size = SEMMC_DEFAULT_SIZE;
++	uint8_t extcsd[SEMMC_SECTOR] __attribute__((aligned(8)));
 +	uint32_t caps, ps, r1 = 0, rca = 1;
 +	uint16_t clk;
 +	int err;
 +
-+	if (xemmc.attached) {
++	if (semmc.attached) {
 +		return 0;
 +	}
 +
-+	err = xemmc_dt_lookup(&phys, &size);
++	err = semmc_dt_lookup(&phys, &size);
 +	if (err) {
-+		XEMMC_LOG("no usable %s node (errno %d), using 0x%llx",
-+		    XEMMC_DT_PATH, err, (unsigned long long)XEMMC_DEFAULT_PHYS);
-+		phys = XEMMC_DEFAULT_PHYS;
-+		size = XEMMC_DEFAULT_SIZE;
++		SEMMC_LOG("no usable %s node (errno %d), using 0x%llx",
++		    SEMMC_DT_PATH, err, (unsigned long long)SEMMC_DEFAULT_PHYS);
++		phys = SEMMC_DEFAULT_PHYS;
++		size = SEMMC_DEFAULT_SIZE;
 +	}
 +	size = (size + PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
 +
-+	if (xemmc.base == NULL) {
-+		xemmc.base = (volatile uint8_t *)ml_io_map((vm_offset_t)phys,
++	if (semmc.base == NULL) {
++		semmc.base = (volatile uint8_t *)ml_io_map((vm_offset_t)phys,
 +		    (vm_size_t)size);
-+		if (xemmc.base == NULL) {
-+			XEMMC_LOG("ml_io_map(0x%llx) failed", (unsigned long long)phys);
++		if (semmc.base == NULL) {
++			SEMMC_LOG("ml_io_map(0x%llx) failed", (unsigned long long)phys);
 +			return ENOMEM;
 +		}
-+		xemmc.phys = phys;
++		semmc.phys = phys;
 +	}
 +
-+	/* The AHB interface remains readable even when ABL gates SDCLK. */
-+	caps = xemmc_r32(SDHCI_CAPABILITIES);
-+	clk  = xemmc_r16(SDHCI_CLOCK_CONTROL);
-+	ps   = xemmc_r32(SDHCI_PRESENT_STATE);
-+	XEMMC_LOG("host @0x%llx ver=0x%04x caps=0x%08x/0x%08x clk=0x%04x ps=0x%08x "
++	/*
++	 * NOTE: if SDCC1 clocks are gated by ABL the register reads below
++	 * fault instead of returning all-ones; that is the signal that
++	 * semmc_hw_bringup() needs to be implemented from the u-boot code.
++	 */
++	caps = semmc_r32(SDHCI_CAPABILITIES);
++	clk  = semmc_r16(SDHCI_CLOCK_CONTROL);
++	ps   = semmc_r32(SDHCI_PRESENT_STATE);
++	SEMMC_LOG("host @0x%llx ver=0x%04x caps=0x%08x/0x%08x clk=0x%04x ps=0x%08x "
 +	    "pwr=0x%02x hc=0x%02x hc2=0x%04x",
-+	    (unsigned long long)xemmc.phys, xemmc_r16(SDHCI_HOST_VERSION), caps,
-+	    xemmc_r32(SDHCI_CAPABILITIES_1), clk, ps,
-+	    xemmc_r8(SDHCI_POWER_CONTROL), xemmc_r8(SDHCI_HOST_CONTROL),
-+	    xemmc_r16(SDHCI_HOST_CONTROL2));
++	    (unsigned long long)semmc.phys, semmc_r16(SDHCI_HOST_VERSION), caps,
++	    semmc_r32(SDHCI_CAPABILITIES_1), clk, ps,
++	    semmc_r8(SDHCI_POWER_CONTROL), semmc_r8(SDHCI_HOST_CONTROL),
++	    semmc_r16(SDHCI_HOST_CONTROL2));
 +
 +	if (caps == 0 || caps == 0xFFFFFFFFu) {
-+		XEMMC_LOG("capabilities read 0x%08x: controller not alive", caps);
-+		err = xemmc_hw_bringup();
++		SEMMC_LOG("capabilities read 0x%08x: controller not alive", caps);
++		err = semmc_hw_bringup();
 +		if (err) {
-+			XEMMC_LOG("host bring-up failed (errno %d)", err);
-+			return err;
-+		}
-+		caps = xemmc_r32(SDHCI_CAPABILITIES);
-+		if (caps == 0 || caps == 0xFFFFFFFFu) {
++			SEMMC_LOG("hw bring-up not implemented (errno %d)", err);
 +			return ENXIO;
 +		}
-+		clk = xemmc_r16(SDHCI_CLOCK_CONTROL);
++		caps = semmc_r32(SDHCI_CAPABILITIES);
 +	}
 +	if ((clk & (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE | SDHCI_CLK_CARD_EN)) !=
 +	    (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE | SDHCI_CLK_CARD_EN) ||
-+	    !(xemmc_r8(SDHCI_POWER_CONTROL) & SDHCI_POWER_ON)) {
-+		XEMMC_LOG("SD clock/power not left running by ABL (clk=0x%04x)", clk);
-+		err = xemmc_hw_bringup();
++	    !(semmc_r8(SDHCI_POWER_CONTROL) & SDHCI_POWER_ON)) {
++		SEMMC_LOG("SD clock/power not left running by ABL (clk=0x%04x)", clk);
++		err = semmc_hw_bringup();
 +		if (err) {
-+			XEMMC_LOG("SD clock bring-up failed (errno %d)", err);
-+			return err;
-+		}
-+		clk = xemmc_r16(SDHCI_CLOCK_CONTROL);
-+		if ((clk & (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE |
-+		    SDHCI_CLK_CARD_EN)) != (SDHCI_CLK_INT_EN | SDHCI_CLK_INT_STABLE |
-+		    SDHCI_CLK_CARD_EN) ||
-+		    !(xemmc_r8(SDHCI_POWER_CONTROL) & SDHCI_POWER_ON)) {
-+			XEMMC_LOG("SD clock/power still off after bring-up (clk=0x%04x)", clk);
-+			return ENOTSUP;
++			SEMMC_LOG("hw bring-up not implemented (errno %d)", err);
++			return ENXIO;
 +		}
 +	}
 +
 +	/* Polled operation: latch the status bits we look at, no IRQs. */
-+	xemmc_w32(SDHCI_INT_ENABLE, XEMMC_INT_ENABLE_MASK);
-+	xemmc_w32(SDHCI_SIGNAL_ENABLE, 0);
-+	xemmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
++	semmc_w32(SDHCI_INT_ENABLE, SEMMC_INT_ENABLE_MASK);
++	semmc_w32(SDHCI_SIGNAL_ENABLE, 0);
++	semmc_w32(SDHCI_INT_STATUS, SDHCI_INT_ALL);
 +
 +	(void)PE_parse_boot_argn("emmcrca", &rca, sizeof(rca));
-+	xemmc.rca = rca & 0xFFFFu;
++	semmc.rca = rca & 0xFFFFu;
 +
-+	err = xemmc_card_status(&r1);
++	err = semmc_card_status(&r1);
 +	if (err) {
-+		XEMMC_LOG("CMD13 (RCA %u) failed, errno %d - card not addressed "
-+		    "by ABL? try emmcrca=", xemmc.rca, err);
++		SEMMC_LOG("CMD13 (RCA %u) failed, errno %d - card not addressed "
++		    "by ABL? try emmcrca=", semmc.rca, err);
 +		return err == ETIMEDOUT ? ENXIO : err;
 +	}
-+	XEMMC_LOG("card R1=0x%08x state=%u", r1, MMC_STATE(r1));
++	SEMMC_LOG("card R1=0x%08x state=%u", r1, MMC_STATE(r1));
 +
 +	if (MMC_STATE(r1) == MMC_STATE_DATA || MMC_STATE(r1) == MMC_STATE_RCV) {
-+		XEMMC_LOG("card stuck in data state, sending CMD12");
-+		xemmc_abort();
-+		err = xemmc_card_status(&r1);
++		SEMMC_LOG("card stuck in data state, sending CMD12");
++		semmc_abort();
++		err = semmc_card_status(&r1);
 +		if (err) {
 +			return err;
 +		}
 +	}
 +	if (MMC_STATE(r1) == MMC_STATE_STBY) {
-+		err = xemmc_cmd(MMC_SELECT_CARD, xemmc.rca << 16,
++		err = semmc_cmd(MMC_SELECT_CARD, semmc.rca << 16,
 +		    SDHCI_CMD_RESP_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX, 0, &r1);
 +		if (err) {
-+			XEMMC_LOG("CMD7 select failed, errno %d", err);
++			SEMMC_LOG("CMD7 select failed, errno %d", err);
 +			return err;
 +		}
-+		err = xemmc_card_status(&r1);
++		err = semmc_card_status(&r1);
 +		if (err) {
 +			return err;
 +		}
 +	}
 +	if (MMC_STATE(r1) != MMC_STATE_TRAN) {
-+		XEMMC_LOG("card not in transfer state (state=%u)", MMC_STATE(r1));
++		SEMMC_LOG("card not in transfer state (state=%u)", MMC_STATE(r1));
 +		return ENXIO;
 +	}
 +
 +	/* Diagnostics only: capacity and which hw partition is selected. */
-+	err = xemmc_xfer_read(MMC_SEND_EXT_CSD, 0, 1, extcsd);
++	err = semmc_xfer_read(MMC_SEND_EXT_CSD, 0, 1, extcsd);
 +	if (err == 0) {
-+		xemmc.dev_sectors = xemmc_le32(extcsd + EXT_CSD_SEC_COUNT);
-+		XEMMC_LOG("EXT_CSD: sectors=%llu (%llu MiB) part_config=0x%02x "
++		semmc.dev_sectors = semmc_le32(extcsd + EXT_CSD_SEC_COUNT);
++		SEMMC_LOG("EXT_CSD: sectors=%llu (%llu MiB) part_config=0x%02x "
 +		    "bus_width=%u hs_timing=0x%02x",
-+		    (unsigned long long)xemmc.dev_sectors,
-+		    (unsigned long long)(xemmc.dev_sectors / 2048),
++		    (unsigned long long)semmc.dev_sectors,
++		    (unsigned long long)(semmc.dev_sectors / 2048),
 +		    extcsd[EXT_CSD_PART_CONFIG], extcsd[EXT_CSD_BUS_WIDTH],
 +		    extcsd[EXT_CSD_HS_TIMING]);
 +		if (extcsd[EXT_CSD_PART_CONFIG] & 0x07) {
-+			XEMMC_LOG("warning: boot/RPMB partition selected, GPT view "
++			SEMMC_LOG("warning: boot/RPMB partition selected, GPT view "
 +			    "will not be the user area");
 +		}
-+		if (xemmc.dev_sectors == 0) {
-+			XEMMC_LOG("byte-addressed (<2GB) cards are not supported");
++		if (semmc.dev_sectors == 0) {
++			SEMMC_LOG("byte-addressed (<2GB) cards are not supported");
 +			return ENOTSUP;
 +		}
 +	} else {
-+		XEMMC_LOG("EXT_CSD read failed (errno %d), continuing without size",
++		SEMMC_LOG("EXT_CSD read failed (errno %d), continuing without size",
 +		    err);
-+		xemmc.dev_sectors = 0;
++		semmc.dev_sectors = 0;
 +	}
 +
-+	xemmc.attached = 1;
++	semmc.attached = 1;
 +	return 0;
 +}
 +
@@ -926,17 +893,17 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +
 +/* Read-only GPT dump. Safe to call any time; never registers anything. */
 +int
-+xun_emmc_probe(void)
++sweet_emmc_probe(void)
 +{
 +	int err;
 +
-+	lck_mtx_lock(&xemmc_lock);
-+	err = xemmc_attach();
++	lck_mtx_lock(&semmc_lock);
++	err = semmc_attach();
 +	if (err == 0) {
-+		err = xemmc_gpt_scan(NULL, 1, NULL);
++		err = semmc_gpt_scan(NULL, 1, NULL);
 +	}
-+	lck_mtx_unlock(&xemmc_lock);
-+	XEMMC_LOG("probe %s (errno %d)", err ? "failed" : "ok", err);
++	lck_mtx_unlock(&semmc_lock);
++	SEMMC_LOG("probe %s (errno %d)", err ? "failed" : "ok", err);
 +	return err;
 +}
 +
@@ -945,51 +912,51 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 + * the GPT. 0 on success, errno otherwise. Idempotent.
 + */
 +int
-+xun_emmc_init(void)
++sweet_emmc_init(void)
 +{
 +	char name[40] = { 0 };
 +	uint32_t probe = 0;
 +	int err;
 +
-+	lck_mtx_lock(&xemmc_lock);
-+	if (xemmc.ready) {
-+		lck_mtx_unlock(&xemmc_lock);
++	lck_mtx_lock(&semmc_lock);
++	if (semmc.ready) {
++		lck_mtx_unlock(&semmc_lock);
 +		return 0;
 +	}
 +
-+	err = xemmc_attach();
++	err = semmc_attach();
 +	if (err) {
 +		goto out;
 +	}
 +	if (PE_parse_boot_argn("emmcprobe", &probe, sizeof(probe)) && probe) {
-+		(void)xemmc_gpt_scan(NULL, 1, NULL);
++		(void)semmc_gpt_scan(NULL, 1, NULL);
 +	}
 +
 +	if (!PE_parse_boot_argn("emmcroot", name, sizeof(name)) &&
 +	    !PE_parse_boot_argn("emmcrd", name, sizeof(name))) {
-+		XEMMC_LOG("no emmcroot=<partition> boot-arg");
++		SEMMC_LOG("no emmcroot=<partition> boot-arg");
 +		err = EINVAL;
 +		goto out;
 +	}
 +	name[sizeof(name) - 1] = '\0';
 +
-+	err = xemmc_gpt_scan(name, 0, &xemmc.part);
++	err = semmc_gpt_scan(name, 0, &semmc.part);
 +	if (err == ENOENT) {
-+		XEMMC_LOG("partition '%s' not found in GPT", name);
++		SEMMC_LOG("partition '%s' not found in GPT", name);
 +	}
 +	if (err) {
 +		goto out;
 +	}
 +
-+	XEMMC_LOG("root partition '%s': lba %llu..%llu (%llu MiB), read-only",
-+	    xemmc.part.name, (unsigned long long)xemmc.part.first,
-+	    (unsigned long long)xemmc.part.last,
-+	    (unsigned long long)((xemmc.part.last - xemmc.part.first + 1) / 2048));
-+	xemmc.ready = 1;
++	SEMMC_LOG("root partition '%s': lba %llu..%llu (%llu MiB), read-only",
++	    semmc.part.name, (unsigned long long)semmc.part.first,
++	    (unsigned long long)semmc.part.last,
++	    (unsigned long long)((semmc.part.last - semmc.part.first + 1) / 2048));
++	semmc.ready = 1;
 +out:
-+	lck_mtx_unlock(&xemmc_lock);
++	lck_mtx_unlock(&semmc_lock);
 +	if (err) {
-+		XEMMC_LOG("init failed (errno %d)", err);
++		SEMMC_LOG("init failed (errno %d)", err);
 +	}
 +	return err;
 +}
@@ -998,10 +965,10 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +/* BSD block device                                                    */
 +/* ------------------------------------------------------------------ */
 +static int
-+xemmc_bopen(dev_t dev, int flags, int devtype, struct proc *p)
++semmc_bopen(dev_t dev, int flags, int devtype, struct proc *p)
 +{
 +#pragma unused(devtype, p)
-+	if (minor(dev) != 0 || !xemmc.ready) {
++	if (minor(dev) != 0 || !semmc.ready) {
 +		return ENXIO;
 +	}
 +	if (flags & FWRITE) {
@@ -1011,25 +978,25 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +}
 +
 +static int
-+xemmc_bclose(dev_t dev, int flags, int devtype, struct proc *p)
++semmc_bclose(dev_t dev, int flags, int devtype, struct proc *p)
 +{
 +#pragma unused(dev, flags, devtype, p)
 +	return 0;
 +}
 +
 +static int
-+xemmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
++semmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
 +{
 +#pragma unused(flags, p)
-+	if (minor(dev) != 0 || !xemmc.ready) {
++	if (minor(dev) != 0 || !semmc.ready) {
 +		return ENXIO;
 +	}
 +	switch (cmd) {
 +	case DKIOCGETBLOCKSIZE:
-+		*(uint32_t *)data = XEMMC_SECTOR;
++		*(uint32_t *)data = SEMMC_SECTOR;
 +		return 0;
 +	case DKIOCGETBLOCKCOUNT:
-+		*(uint64_t *)data = xemmc.part.last - xemmc.part.first + 1;
++		*(uint64_t *)data = semmc.part.last - semmc.part.first + 1;
 +		return 0;
 +	case DKIOCISWRITABLE:
 +		*(int *)data = 0;
@@ -1040,22 +1007,22 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +}
 +
 +static int
-+xemmc_bdump(void)
++semmc_bdump(void)
 +{
 +	return ENXIO;
 +}
 +
 +static int
-+xemmc_bpsize(dev_t dev)
++semmc_bpsize(dev_t dev)
 +{
-+	if (minor(dev) != 0 || !xemmc.ready) {
++	if (minor(dev) != 0 || !semmc.ready) {
 +		return -1;
 +	}
-+	return (int)(xemmc.part.last - xemmc.part.first + 1);
++	return (int)(semmc.part.last - semmc.part.first + 1);
 +}
 +
 +static void
-+xemmc_bstrategy(struct buf *bp)
++semmc_bstrategy(struct buf *bp)
 +{
 +	caddr_t addr = NULL;
 +	uint64_t count, nblk = 0, blkno, parts;
@@ -1069,20 +1036,20 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +
 +	count = (uint64_t)buf_count(bp);
 +	blkno = (uint64_t)buf_blkno(bp);
-+	parts = xemmc.part.last - xemmc.part.first + 1;
-+	if (!xemmc.ready || (count % XEMMC_SECTOR) != 0) {
-+		err = xemmc.ready ? EINVAL : ENXIO;
++	parts = semmc.part.last - semmc.part.first + 1;
++	if (!semmc.ready || (count % SEMMC_SECTOR) != 0) {
++		err = semmc.ready ? EINVAL : ENXIO;
 +	} else {
-+		nblk = count / XEMMC_SECTOR;
++		nblk = count / SEMMC_SECTOR;
 +		if ((int64_t)buf_blkno(bp) < 0 || blkno + nblk > parts) {
 +			err = EIO;
 +		} else if (nblk != 0) {
 +			err = buf_map(bp, &addr);
 +			if (err == 0) {
-+				lck_mtx_lock(&xemmc_lock);
-+				err = xemmc_read_blocks(xemmc.part.first + blkno,
++				lck_mtx_lock(&semmc_lock);
++				err = semmc_read_blocks(semmc.part.first + blkno,
 +				    (uint32_t)nblk, addr);
-+				lck_mtx_unlock(&xemmc_lock);
++				lck_mtx_unlock(&semmc_lock);
 +				buf_unmap(bp);
 +			}
 +		}
@@ -1097,42 +1064,42 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +	buf_biodone(bp);
 +}
 +
-+static struct bdevsw xemmc_bdevsw = {
-+	.d_open     = xemmc_bopen,
-+	.d_close    = xemmc_bclose,
-+	.d_strategy = xemmc_bstrategy,
-+	.d_ioctl    = xemmc_bioctl,
-+	.d_dump     = (dump_fcn_t *)xemmc_bdump,
-+	.d_psize    = xemmc_bpsize,
++static struct bdevsw semmc_bdevsw = {
++	.d_open     = semmc_bopen,
++	.d_close    = semmc_bclose,
++	.d_strategy = semmc_bstrategy,
++	.d_ioctl    = semmc_bioctl,
++	.d_dump     = (dump_fcn_t *)semmc_bdump,
++	.d_psize    = semmc_bpsize,
 +	.d_type     = D_DISK,
 +};
 +
 +/*
 + * Register emmcroot0 with BSD and return its dev_t. Registration only
-+ * happens once xun_emmc_init() has succeeded.
++ * happens once sweet_emmc_init() has succeeded.
 + */
 +int
-+xun_emmc_register_root(dev_t *out)
++sweet_emmc_register_root(dev_t *out)
 +{
 +	int err, major;
 +
-+	err = xun_emmc_init();
++	err = sweet_emmc_init();
 +	if (err) {
 +		return err;
 +	}
-+	lck_mtx_lock(&xemmc_lock);
-+	if (xemmc.major < 0) {
-+		major = bdevsw_add(-1, &xemmc_bdevsw);
++	lck_mtx_lock(&semmc_lock);
++	if (semmc.major < 0) {
++		major = bdevsw_add(-1, &semmc_bdevsw);
 +		if (major < 0) {
-+			lck_mtx_unlock(&xemmc_lock);
-+			XEMMC_LOG("bdevsw_add failed");
++			lck_mtx_unlock(&semmc_lock);
++			SEMMC_LOG("bdevsw_add failed");
 +			return ENODEV;
 +		}
-+		xemmc.major = major;
-+		XEMMC_LOG("registered emmcroot0 as block major %d", major);
++		semmc.major = major;
++		SEMMC_LOG("registered emmcroot0 as block major %d", major);
 +	}
-+	*out = makedev(xemmc.major, 0);
-+	lck_mtx_unlock(&xemmc_lock);
++	*out = makedev(semmc.major, 0);
++	lck_mtx_unlock(&semmc_lock);
 +	return 0;
 +}
 +
@@ -1143,7 +1110,7 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 + *           <0  : it was ours but failed, value is -errno
 + */
 +int
-+xun_emmc_find_root(const char *rd, char *root_name, size_t name_sz,
++sweet_emmc_find_root(const char *rd, char *root_name, size_t name_sz,
 +    dev_t *root)
 +{
 +	int err;
@@ -1151,16 +1118,16 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +	if (rd == NULL || strcmp(rd, "emmcroot0") != 0) {
 +		return 0;
 +	}
-+	err = xun_emmc_register_root(root);
++	err = sweet_emmc_register_root(root);
 +	if (err) {
-+		XEMMC_LOG("root emmcroot0 unavailable (errno %d)", err);
++		SEMMC_LOG("root emmcroot0 unavailable (errno %d)", err);
 +		return -err;
 +	}
 +	strlcpy(root_name, "emmcroot0", name_sz);
-+	XEMMC_LOG("root emmcroot0 -> dev 0x%x", (unsigned)*root);
++	SEMMC_LOG("root emmcroot0 -> dev 0x%x", (unsigned)*root);
 +	return 1;
 +}
 +
 +#else  /* !ARM64_BOARD_CONFIG_SWEET */
-+typedef int xun_emmc_empty_tu_t;
++typedef int sweet_emmc_empty_tu_t;
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
