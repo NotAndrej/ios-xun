@@ -241,7 +241,10 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' and qcom,kryo470 stay because the
     # SweetPlatformExpert and CPU IONameMatch still use them.
-    return node('device-tree', [
+        # SWEET emmc: SDHCI host for eMMC-based bring-up ports.
+    emmc = node('sweet-emmc', [ph(), ('reg', u64(0x04744000, 0x1000))])
+
+return node('device-tree', [
         ph(),
         ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
@@ -250,7 +253,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, emmc] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':

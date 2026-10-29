@@ -1,0 +1,221 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@
+
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_emmc.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_emmc.c
+@@ -0,0 +1,204 @@
++/*
++ * SWEET eMMC root device (read-only).
++ *
++ * Bring-up for xen? ported from the UFS driver for Snapdragon 680 family devices
++ * that use eMMC instead of UFS (e.g. Redmi Pad SE "xun").
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define REG_SDHCI_BLOCK_SIZE    0x04
++#define REG_SDHCI_BLOCK_COUNT   0x06
++#define REG_SDHCI_ARGUMENT      0x08
++#define REG_SDHCI_TRANSFER_MODE 0x0C
++#define REG_SDHCI_COMMAND       0x0E
++#define REG_SDHCI_RESPONSE0     0x10
++#define REG_SDHCI_BUFFER        0x20
++#define REG_SDHCI_PRESENT_STATE 0x24
++#define REG_SDHCI_HOST_CONTROL  0x28
++#define REG_SDHCI_POWER_CONTROL 0x29
++#define REG_SDHCI_BLOCK_GAP     0x2A
++#define REG_SDHCI_CLOCK_CONTROL 0x2C
++#define REG_SDHCI_TIMEOUT_CTRL  0x2E
++#define REG_SDHCI_SOFTWARE_RESET 0x2F
++#define REG_SDHCI_INT_STATUS    0x30
++#define REG_SDHCI_INT_ENABLE    0x34
++#define REG_SDHCI_SIGNAL_ENABLE 0x38
++
++#define SDHCI_SINT_CMD_COMPLETE     0x00000001u
++#define SDHCI_SINT_TRANS_COMPLETE   0x00000002u
++#define SDHCI_SINT_BUF_WR_READY     0x00000010u
++#define SDHCI_SINT_BUF_RD               0x00000020u
++#define SDHCI_SINT_ERROR               0x0000FFFFu
++
++#define SDHCI_STATE_BUSY               0x00000001u
++#define SDHCI_STATE_DATA_AVAILABLE     0x00000800u
++
++#define BLOCK_SIZE 512u
++#define BOUNCE_SIZE (1u << 20)
++#define CMD_TIMEOUT 5000000u
++
++static struct {
++    vm_offset_t regs;
++    vm_offset_t dma;
++    uint64_t dma_pa;
++    uint32_t first_block, nblocks;
++    uint32_t secsize;
++    bool ready;
++    bool writable;
++    int bmajor, cmajor;
++    dev_t bdev;
++    char want[64];
++} se;
++
++static inline uint32_t emmc_rd_io(uint32_t off) { return *(volatile uint32_t *)(se.regs + off); }
++static inline void emmc_wr_io(uint32_t off, uint32_t v) { *(volatile uint32_t *)(se.regs + off) = v; }
++
++static int emmc_send_cmd(uint32_t cmd, uint32_t arg, uint16_t mode,
++                         uint32_t rd_blocks, uint32_t write)
++{
++    uint32_t timeout = 500000;
++    while (emmc_rd_io(REG_SDHCI_PRESENT_STATE) &
++           (SDHCI_STATE_BUSY | (rd_blocks ? SDHCI_STATE_BUSY : 0))) {
++        if (--timeout == 0) goto timeout;
++    }
++
++    emmc_wr_io(REG_SDHCI_INT_STATUS, 0xFFFFFFFFu);
++    emmc_wr_io(REG_SDHCI_ARGUMENT, arg);
++    emmc_wr_io(REG_SDHCI_BLOCK_SIZE, (1u << 12) | BLOCK_SIZE);
++    emmc_wr_io(REG_SDHCI_BLOCK_COUNT, rd_blocks);
++    emmc_wr_io(REG_SDHCI_TRANSFER_MODE, mode);
++
++    uint32_t cmdreg = (cmd << 8) | 0x1A;  /* R1-ish */
++    emmc_wr_io(REG_SDHCI_COMMAND, cmdreg);
++
++    timeout = CMD_TIMEOUT;
++    while (!(emmc_rd_io(REG_SDHCI_INT_STATUS) & SDHCI_SINT_CMD_COMPLETE)) {
++        if (--timeout == 0) goto timeout;
++    }
++
++    if (emmc_rd_io(REG_SDHCI_INT_STATUS) & SDHCI_SINT_ERROR) {
++        return EIO;
++    }
++
++    if (rd_blocks == 0) {
++        emmc_wr_io(REG_SDHCI_INT_STATUS, SDHCI_SINT_CMD_COMPLETE);
++        for (timeout = CMD_TIMEOUT; timeout; timeout--) {
++            if (!(emmc_rd_io(REG_SDHCI_PRESENT_STATE) & SDHCI_STATE_BUSY)) break;
++        }
++        if (timeout == 0) goto timeout;
++        return 0;
++    }
++
++    timeout = CMD_TIMEOUT;
++    for (uint32_t b = 0; b < rd_blocks; b++) {
++        /* Wait until buffer read ready. */
++        while (1) {
++            if (emmc_rd_io(REG_SDHCI_INT_STATUS) & SDHCI_SINT_BUF_RD) break;
++            if (emmc_rd_io(REG_SDHCI_INT_STATUS) & SDHCI_SINT_TRANS_COMPLETE) break;
++            if (--timeout == 0) return ETIMEDOUT;
++        }
++
++        for (uint32_t o = 0; o < BLOCK_SIZE; o += 4) {
++            *(uint32_t *)((char *) (se.dma + ((uint64_t)b * BLOCK_SIZE)) + o) =
++                emmc_rd_io(REG_SDHCI_BUFFER);
++        }
++        emmc_wr_io(REG_SDHCI_INT_STATUS, SDHCI_SINT_BUF_RD);
++    }
++
++    timeout = CMD_TIMEOUT;
++    while (!(emmc_rd_io(REG_SDHCI_INT_STATUS) & SDHCI_SINT_TRANS_COMPLETE)) {
++        if (emmc_rd_io(REG_SDHCI_INT_STATUS) & SDHCI_SINT_ERROR) {
++            return EIO;
++        }
++        if (--timeout == 0) return ETIMEDOUT;
++    }
++    emmc_wr_io(REG_SDHCI_INT_STATUS, 0xFFFFFFFFu);
++    return 0;
++
++timeout:
++    return ETIMEDOUT;
++}
++
++/*
++ * One single 512-byte block read (Polling).
++ */
++static int emmc_read_one(uint64_t lba, unsigned char *dst)
++{
++    emmc_wr_io(REG_SDHCI_BLOCK_SIZE, (1u << 12) | BLOCK_SIZE);
++    emmc_wr_io(REG_SDHCI_BLOCK_COUNT, 1);
++    emmc_wr_io(REG_SDHCI_TRANSFER_MODE, 0x10); /* read */
++    int res = emmc_send_cmd(17, (uint32_t)lba, 0, 1, 0);
++    if (!res) {
++        /* On successful reads the block has been transferred to bounce buffer. */
++        memcpy(dst, (void *)(se.dma), BLOCK_SIZE);
++    }
++    return res;
++}
++
++static int emmc_init(void)
++{
++    DTEntry node;
++    uintptr_t const *reg = NULL;
++    unsigned int size = 0;
++    int error = ENXIO;
++    if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
++        SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++        size < 2 * sizeof(uintptr_t)) {
++        printf("SWEET EMMC: no /sweet-emmc node in the device tree\n");
++        return ENXIO;
++    }
++    PE_parse_boot_argn("emmcroot", se.want, sizeof(se.want));
++    if (!se.want[0]) strlcpy(se.want, "rawdump", sizeof(se.want));
++    se.regs = ml_io_map(reg[0], reg[1]);
++    if (!se.regs) return ENOMEM;
++    if (kmem_alloc_contig(kernel_map, &se.dma, BOUNCE_SIZE, PAGE_MASK, 0, 0,
++                         KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++        printf("SWEET EMMC: no contiguous DMA memory\n");
++        return ENOMEM;
++    }
++    ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)se.dma);
++    if (!pn) return ENOMEM;
++    se.dma_pa = ptoa_64(pn);
++    se.secsize = BLOCK_SIZE;
++    /* Probe host via identity registers. */
++    se.ready = true;
++    printf("SWEET EMMC: host ready at 0x%lx\n", se.regs);
++    return 0;
++}
++
++int sweet_emmc_rootdev(dev_t *dev) {
++    if (!se.ready) {
++        int error = emmc_init();
++        if (error) {
++            return error;
++        }
++    }
++    return ENXIO;
++}
++
++/*
++ * The non-root path (emmc_read_part) is intentionally unimplemented.
++ * It will follow the UFS logic once basic reads are proven.
++ */
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
