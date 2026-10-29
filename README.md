@@ -17,7 +17,7 @@ This repository is the `xun` adaptation of [MakrSas/ios-topaz](https://github.co
 | Shim (Silver -> Gold hand-off) | Verified on a connected Redmi Pad SE |
 | XNU boot through loader | Verified |
 | Kernel console / panic display | Live on the tablet splash framebuffer |
-| Storage root discovery | **Blocked on eMMC**: `Sweet UFS root ufsroot0 unavailable` when an internal root is attempted |
+| Storage root discovery | **Blocked on eMMC**. Booting `rd=ufsroot0` on the tablet prints `Sweet UFS root ufsroot0 unavailable`; the ports now use `/sweet-emmc` plus a separate experimental `sweet_emmc*` root path (still in progress) |
 | USB / touchscreen / GPU / Wi-Fi | Not adapted for the tablet yet |
 
 Verified facts for this machine (from `adb getprop` and a 2026-10-29 device tree dump):
