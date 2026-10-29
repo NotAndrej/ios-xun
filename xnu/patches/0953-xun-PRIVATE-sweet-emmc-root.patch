@@ -1,35 +1,33 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,3 +106,4 @@
+@@ -105,6 +105,7 @@
+
+
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/sweet_emmc.c			standard
  bsd/dev/redwood_sta.c		standard
-diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
---- a/iokit/bsddev/IOKitBSDInit.cpp
-+++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -785,5 +785,28 @@
+--- a/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:27.092252033 +0100
++++ b/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:15.999346513 +0100
+@@ -785,6 +785,26 @@
  #endif
--
+ 
+ 
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	if (strcmp(rdBootVar, "emmcroot0") == 0) {
 +		extern int sweet_emmc_find_root(const char *rd, char *root_name,
 +		                               size_t name_sz, dev_t *root);
 +		int emmc_error = sweet_emmc_find_root(rdBootVar, rootName, rootNameSize, root);
-+		/*
-+		 * sweet_emmc_find_root() follows the usual probe convention:
-+		 * zero means that rd= belongs to another provider, one means it
-+		 * claimed and resolved the root, and negative values are -errno.
-+		 * This branch is reached only for emmcroot0, but keep the explicit
-+		 * success value so a failed eMMC probe can never fall through to an
-+		 * unrelated IOKit root provider.
-+		 */
-+		if (emmc_error == 1) {
++		if (emmc_error == 0) {
 +			IOLog("BSD root: emmcroot0, major %d, minor %d\n",
 +			      major(*root), minor(*root));
 +			*oflags = 0;
 +			goto iofrootx;
++		}
++		if (emmc_error == 1) {
++			/* Handled but not our exact failure value? treat as failure. */
++			panic("IOFindBSDRoot: SWEET emmc root %s handling failed", rdBootVar);
 +		}
 +		panic("IOFindBSDRoot: SWEET emmc root %s unavailable: %d",
 +		      rdBootVar, -emmc_error);
@@ -40,8 +38,8 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
  //	Now check if we are trying to root on a memory device
  //
 --- /dev/null	2026-10-29 06:10:26.054763197 +0100
-+++ b/bsd/dev/sweet_emmc.c	2026-10-29 13:26:50.944258165 +0100
-@@ -0,0 +1,1058 @@
++++ b/bsd/dev/sweet_emmc.c	2026-10-29 17:08:30.266963244 +0100
+@@ -0,0 +1,1091 @@
 +/*
 + * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
@@ -94,8 +92,6 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +/* ------------------------------------------------------------------ */
 +#define SEMMC_LOG(fmt, ...) printf("SWEET EMMC: " fmt "\n", ##__VA_ARGS__)
 +
-+/* osfmk/arm/machine_routines.h does not export this to the BSD layer. */
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern void delay(int usec);
 +#define SEMMC_UDELAY(us) delay(us)
 +
@@ -297,7 +293,42 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 +static int
 +semmc_hw_bringup(void)
 +{
-+	return ENOTSUP;
++	volatile uint32_t *power, *status2, *hc_mode;
++	vm_offset_t core;
++
++	core = ml_io_map(0x04745000ULL, PAGE_SIZE);
++	if (!core) {
++		SEMMC_LOG("bring-up: ml_io_map core failed");
++		return ENOMEM;
++	}
++	power = (volatile uint32_t *)(core + 0x0);
++	status2 = (volatile uint32_t *)(core + 0x6c);
++	hc_mode = (volatile uint32_t *)(core + 0x78);
++
++	SEMMC_LOG("bring-up: power=0x%08x status2=0x%08x hc_mode=0x%08x",
++	    power[0], status2[0], hc_mode[0]);
++
++	/* Trigger self-reset through SW_RST bit (MSM driver). */
++	power[0] = power[0] | 0x00000080u;
++	for (uint32_t t = 0; t < 400000; t++) {
++		if (!(status2[0] & 0x1)) {
++			break;
++		}
++		delay(1);
++	}
++	for (uint32_t t = 0; t < 200000; t++) {
++		if (!(power[0] & 0x00000080u)) {
++			break;
++		}
++		delay(1);
++	}
++	hc_mode[0] = 1;
++	for (uint32_t t = 0; t < 100000; t++) {
++		__asm__ volatile("" ::: "memory");
++	}
++	SEMMC_LOG("bring-up: after reset power=0x%08x status2=0x%08x hc_mode=0x%08x",
++	    power[0], status2[0], hc_mode[0]);
++	return 0;
 +}
 +
 +static int
