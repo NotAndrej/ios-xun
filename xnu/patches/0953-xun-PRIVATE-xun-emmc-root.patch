@@ -6,7 +6,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 +bsd/dev/sweet_emmc.c			standard
 
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-/tmp/keeping a/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:27.092252033 +0100
+a/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:27.092252033 +0100
 +++ b/iokit/bsddev/IOKitBSDInit.cpp	2026-10-29 13:27:15.999346513 +0100
 @@ -785,6 +785,26 @@
  #endif
