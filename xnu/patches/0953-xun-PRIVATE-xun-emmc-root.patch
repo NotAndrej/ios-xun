@@ -4,7 +4,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 @@ -106,3 +106,4 @@
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
-+bsd/dev/xun_emmc.c			standard
++bsd/dev/sweet_emmc.c			standard
  bsd/dev/redwood_sta.c		standard
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
 --- a/iokit/bsddev/IOKitBSDInit.cpp
@@ -40,10 +40,10 @@ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
  //	Now check if we are trying to root on a memory device
  //
 --- /dev/null	2026-10-29 06:10:26.054763197 +0100
-+++ b/bsd/dev/xun_emmc.c	2026-10-29 13:26:50.944258165 +0100
++++ b/bsd/dev/sweet_emmc.c	2026-10-29 13:26:50.944258165 +0100
 @@ -0,0 +1,1058 @@
 +/*
-+ * xun_emmc.c - polled SDHCI / eMMC read-only root driver
++ * sweet_emmc.c - polled SDHCI / eMMC read-only root driver
 + *                Xiaomi Redmi Pad SE (SM6225 "khaje", SDCC1 @ 0x04744000)
 + *
 + * Counterpart of sweet_ufs.c for the eMMC variant of the pad.
